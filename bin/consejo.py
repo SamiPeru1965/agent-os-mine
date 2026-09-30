@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Concilio: pregunta a 3 modelos vía OpenRouter, sintetiza con un 4to, guarda acta en el vault."""
-import os, sys, json, asyncio, datetime, re, pathlib, urllib.request, subprocess
+import os, sys, json, asyncio, datetime, re, pathlib, urllib.request, urllib.error, subprocess, time
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -13,7 +13,7 @@ CONCILIO = [
 ]
 ARBITRO = ("Claude Sonnet 4.6 (árbitro)", "anthropic/claude-sonnet-4.6")
 
-def call_model(model_id, messages, max_tokens=2000):
+def _post(model_id, messages, max_tokens):
     body = json.dumps({"model": model_id, "max_tokens": max_tokens, "messages": messages}).encode()
     req = urllib.request.Request(API_URL, data=body, headers={
         "Authorization": f"Bearer {API_KEY}",
@@ -21,12 +21,43 @@ def call_model(model_id, messages, max_tokens=2000):
         "HTTP-Referer": "https://github.com/sci/agent-os",
         "X-Title": "Agent OS Concilio",
     }, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = json.loads(r.read())
+        return data["choices"][0]["message"]["content"]
+
+def call_model(model_id, messages, max_tokens=2000):
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read())
-            return data["choices"][0]["message"]["content"]
+        return _post(model_id, messages, max_tokens)
     except Exception as e:
         return f"[ERROR llamando a {model_id}: {e}]"
+
+RED_TRANSITORIA = ("Remote end closed", "Connection reset", "Connection refused", "Network is unreachable")
+
+def _transitorio(e):
+    if isinstance(e, urllib.error.HTTPError):  # antes que URLError: es subclase
+        return e.code in (502, 503, 504)
+    if isinstance(e, (ConnectionResetError, TimeoutError)):  # incluye http.client.RemoteDisconnected y socket.timeout
+        return True
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(e.reason, TimeoutError) or any(s in str(e.reason) for s in RED_TRANSITORIA)
+    return False
+
+def call_arbitro(messages, max_tokens=3000):
+    """Solo el árbitro reintenta: es punto único de falla (los drafts se cubren entre sí)."""
+    razones = []
+    for espera in (2, 4, None):
+        try:
+            texto = _post(ARBITRO[1], messages, max_tokens)
+            if razones:
+                n = len(razones)
+                texto += f"\n\n_(síntesis obtenida tras {n} reintento{'s' if n > 1 else ''} por {'; '.join(dict.fromkeys(razones))})_"
+            return texto
+        except Exception as e:
+            if espera is None or not _transitorio(e):
+                return f"[ERROR llamando a {ARBITRO[1]}: {e}]"
+            razones.append(f"{type(e).__name__}: {e}")
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Árbitro falló ({razones[-1]}), reintento en {espera}s...", file=sys.stderr)
+            time.sleep(espera)
 
 async def perspectiva(nombre, model_id, tema):
     loop = asyncio.get_event_loop()
@@ -45,7 +76,7 @@ async def main(tema):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Sintetizando con {ARBITRO[0]}...", file=sys.stderr)
     ctx = "\n\n---\n\n".join([f"## Perspectiva {i+1}: {n}\n\n{r}" for i, (n, _, r) in enumerate(drafts)])
     sintesis_prompt = [{"role": "user", "content": f"Eres el árbitro de un concilio de modelos. La pregunta original fue:\n\n>>> {tema} <<<\n\nRecibiste 3 perspectivas independientes:\n\n{ctx}\n\nTu tarea: sintetiza en un veredicto único, señalando (1) los puntos de acuerdo entre las perspectivas, (2) las divergencias significativas y por qué crees que ocurren, (3) tu recomendación final integrada. Sé claro y accionable."}]
-    sintesis = call_model(ARBITRO[1], sintesis_prompt, max_tokens=3000)
+    sintesis = call_arbitro(sintesis_prompt)
 
     fecha = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
     slug = re.sub(r'[^a-z0-9]+', '-', tema.lower())[:50].strip('-')
