@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Notion -> Agent OS: clasifica ideas nuevas de la BD Ideas con el Concilio completo (consejo.py)."""
-import os, sys, json, re, datetime, pathlib, unicodedata, urllib.request, urllib.error, subprocess
+import os, sys, json, re, datetime, pathlib, unicodedata, urllib.request, urllib.error, subprocess, time, tempfile
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DB = os.environ.get("NOTION_IDEAS_DB")
@@ -10,6 +10,11 @@ VAULT = pathlib.Path.home() / "obsidian-agentos/Shared/ideas"
 CONSEJO = pathlib.Path.home() / "agent-os/bin/consejo.py"
 # ponytail: el wrapper corta a los 300s y cada concilio puede tardar hasta 120s; el resto queda para el siguiente cron
 MAX_IDEAS_POR_CORRIDA = 2
+DEDUP_MODELO = "anthropic/claude-haiku-4.5"
+DEDUP_UMBRAL = 0.8
+
+sys.path.insert(0, str(CONSEJO.parent))
+from consejo import _post, _transitorio  # noqa: E402
 
 TIPOS = {"feature", "bug", "tarea", "pregunta", "proyecto"}
 VERTICALES = {"SmartCont", "Charlie House", "BeautyAppoint", "SuperSeller", "YouTube", "Print", "Aprender", "Cross"}
@@ -179,6 +184,124 @@ concilio_acta: "../consejos/{acta.name}"
     return path
 
 
+def leer_frontmatter(texto):
+    """Frontmatter YAML plano (clave: valor) sin librería; mismo patrón que actividad.ts."""
+    m = re.match(r"---\n(.*?)\n---", texto, re.S)
+    if not m:
+        return {}
+    fm = {}
+    for linea in m.group(1).splitlines():
+        if ":" not in linea:
+            continue
+        k, v = linea.split(":", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] == '"':
+            v = v[1:-1].replace('\\"', '"')
+        fm[k.strip()] = v
+    return fm
+
+
+def cargar_ideas_previas(limite=20, carpeta=VAULT):
+    if not carpeta.is_dir():
+        return []
+    archivos = sorted(carpeta.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    previas = []
+    for p in archivos:
+        if len(previas) >= limite:
+            break
+        fm = leer_frontmatter(p.read_text(errors="replace"))
+        if not fm.get("idea"):
+            continue
+        fecha = fm.get("procesada") or fm.get("capturada") or \
+            datetime.date.fromtimestamp(p.stat().st_mtime).isoformat()
+        previas.append({"slug": p.stem, "idea": fm["idea"], "tipo": fm.get("tipo", ""),
+                        "vertical": fm.get("vertical", ""), "esfuerzo": fm.get("esfuerzo", ""),
+                        "fecha": fecha})
+    return previas
+
+
+def _parsear_dup(texto):
+    """dict validado o None si la respuesta no sirve (ante duda, no bloquea)."""
+    m = re.search(r"\{.*\}", texto, re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict) or not {"es_dup", "dup_slug", "confianza"} <= d.keys():
+        return None
+    c = d["confianza"]
+    if not isinstance(d["es_dup"], bool) or isinstance(c, bool) or not isinstance(c, (int, float)) or not 0 <= c <= 1:
+        return None
+    if d["dup_slug"] is not None and not isinstance(d["dup_slug"], str):
+        return None
+    if d["dup_slug"]:
+        d["dup_slug"] = d["dup_slug"].strip().removesuffix(".md")
+    return d
+
+
+def verificar_duplicado(idea_nueva, detalle_nuevo, ideas_previas):
+    if not ideas_previas:
+        return None
+    lista = "\n".join(f'{i}. [{p["slug"]}] "{p["idea"]}" ({p["tipo"]}/{p["vertical"]}/{p["esfuerzo"]})'
+                      for i, p in enumerate(ideas_previas, 1))
+    prompt = f"""Eres un detector de ideas duplicadas en el sistema de captura de Saul (entrepreneur peruano, Imperio Digital).
+
+Idea nueva capturada:
+Título: "{idea_nueva}"
+Detalle: "{detalle_nuevo or 'sin detalle'}"
+
+Ideas anteriores ya procesadas:
+{lista}
+
+Determina si la idea nueva es duplicada semántica (misma intención aunque con palabras distintas) de alguna anterior. NO consideres duplicadas ideas que suenan similar pero son de verticales distintas, ni variaciones sustanciales (ej: "hacer curso Agent OS" vs "hacer tutorial YouTube Agent OS" NO son duplicadas si cambia el formato).
+
+Devuelve SOLO un objeto JSON válido (sin ```json, sin texto extra):
+{{
+  "es_dup": boolean,
+  "dup_slug": slug exacto de la idea anterior más similar (string) o null si es_dup=false,
+  "confianza": número 0.0-1.0 (qué tan seguro estás)
+}}"""
+    # mismo retry que el árbitro en consejo.py: solo errores transitorios, backoff 2s/4s
+    razones = []
+    for espera in (2, 4, None):
+        try:
+            texto = _post(DEDUP_MODELO, [{"role": "user", "content": prompt}], 200, temperature=0)
+            break
+        except Exception as e:
+            if espera is None or not _transitorio(e):
+                log(f"WARN dedup: fallo llamando a {DEDUP_MODELO} ({e}); sigue al Concilio")
+                return None
+            razones.append(f"{type(e).__name__}: {e}")
+            log(f"dedup falló ({razones[-1]}), reintento en {espera}s...")
+            time.sleep(espera)
+    if razones:
+        n = len(razones)
+        log(f"(dedup resuelto tras {n} reintento{'s' if n > 1 else ''} por {'; '.join(dict.fromkeys(razones))})")
+    d = _parsear_dup(texto)
+    if d is None:
+        log(f"WARN dedup: respuesta inválida {texto.strip()[:200]!r}; sigue al Concilio")
+    return d
+
+
+def marcar_duplicada_en_notion(page_id, dup_slug, idea_previa_dict):
+    body = {
+        "properties": {
+            "Estado": {"select": {"name": "🔄 duplicada"}},
+            "Análisis": {"rich_text": rich_text(f"Duplicada de [[{dup_slug}]] - {idea_previa_dict['idea']}")},
+            "Accion Tomada": {"rich_text": rich_text("No se dispara Concilio. Ver análisis en nota original.")},
+            "Procesada": {"date": {"start": idea_previa_dict["fecha"]}},
+        }
+    }
+    try:
+        notion_request("PATCH", f"/pages/{page_id}", body)
+        return True
+    except Exception as e:
+        log(f"✗ fallo marcando duplicada en Notion ({e})")
+        return False
+
+
 def selftest():
     acta = """# Consejo: x
 
@@ -208,6 +331,27 @@ Todos coinciden.
         except ValueError:
             pass
     assert len(rich_text("a" * 4500)) == 3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        assert cargar_ideas_previas(carpeta=tmp / "no-existe") == []
+        (tmp / "2026-01-01-vieja.md").write_text('---\nidea: "dice \\"hola\\""\ntipo: tarea\nvertical: Cross\n'
+                                                  'esfuerzo: S\ncapturada: 2026-01-01\n---\n# x\n')
+        (tmp / "2026-01-02-nueva.md").write_text('---\nidea: "nueva: con dos puntos"\nprocesada: 2026-01-03\n---\n')
+        (tmp / "sin-frontmatter.md").write_text("# nada\n")
+        os.utime(tmp / "2026-01-01-vieja.md", (1, 1))
+        p = cargar_ideas_previas(carpeta=tmp)
+        assert [x["slug"] for x in p] == ["2026-01-02-nueva", "2026-01-01-vieja"], p
+        assert p[0]["idea"] == "nueva: con dos puntos" and p[0]["fecha"] == "2026-01-03", p
+        assert p[1]["idea"] == 'dice "hola"' and p[1]["fecha"] == "2026-01-01" and p[1]["vertical"] == "Cross", p
+        assert len(cargar_ideas_previas(limite=1, carpeta=tmp)) == 1
+
+    ok = _parsear_dup('```json\n{"es_dup": true, "dup_slug": "2026-09-23-x.md", "confianza": 0.9}\n```')
+    assert ok == {"es_dup": True, "dup_slug": "2026-09-23-x", "confianza": 0.9}, ok
+    assert _parsear_dup('{"es_dup": false, "dup_slug": null, "confianza": 0}')["es_dup"] is False
+    for malo in ("nada", "{roto", '{"es_dup": true, "confianza": 0.9}', '{"es_dup": "si", "dup_slug": null, "confianza": 1}',
+                 '{"es_dup": true, "dup_slug": "x", "confianza": 1.5}'):
+        assert _parsear_dup(malo) is None, malo
     print("selftest OK")
 
 
@@ -234,6 +378,8 @@ def main():
     hoy = datetime.date.today().isoformat()
     procesadas = 0
     escritas = 0
+    duplicadas = 0
+    fallidas = 0
 
     for page in ideas:
         page_id = page["id"]
@@ -241,8 +387,26 @@ def main():
             idea, detalle = extraer_idea(page)
         except Exception as e:
             log(f"✗ [{page_id}] error: no se pudo leer propiedades ({e})")
+            fallidas += 1
             continue
         capturada = page.get("created_time", hoy)[:10]
+
+        # Nivel 2: dedup contra el vault antes de gastar en el Concilio.
+        # Se recarga en cada vuelta para ver también las notas escritas en esta misma corrida.
+        previas = cargar_ideas_previas(limite=20)
+        dup = verificar_duplicado(idea, detalle, previas)
+        if dup and dup.get("es_dup") and dup.get("confianza", 0) >= DEDUP_UMBRAL:
+            slug = dup.get("dup_slug") or ""
+            previa = next((p for p in previas if p["slug"] == slug), None)
+            if previa:
+                if marcar_duplicada_en_notion(page_id, slug, previa):
+                    log(f"⊘ [{idea}] duplicada de [{slug}] (confianza {dup['confianza']:.2f})")
+                    duplicadas += 1
+                else:
+                    log(f"✗ [{idea}] error: duplicada de [{slug}] pero no se pudo marcar en Notion; se reintenta en la próxima corrida")
+                    fallidas += 1
+                continue  # no se llama al Concilio
+            log(f"⚠ [{idea}] marcada dup pero slug {slug!r} no encontrado, procesa normal")
 
         log(f"Consultando al Concilio: {idea!r}")
         try:
@@ -250,12 +414,14 @@ def main():
             clasificacion, sintesis = parsear_acta(acta.read_text())
         except Exception as e:
             log(f"✗ [{idea}] error: {e}")
+            fallidas += 1
             continue
 
         try:
             actualizar_notion(page_id, clasificacion, sintesis, hoy)
         except Exception as e:
             log(f"✗ [{idea}] error: fallo actualizando Notion ({e}) (acta: {acta})")
+            fallidas += 1
             continue
         procesadas += 1
 
@@ -271,7 +437,7 @@ def main():
         if path:
             log(f"  nota: {path}")
 
-    print(f"{procesadas} ideas procesadas, {escritas} escritas al vault")
+    print(f"{procesadas} procesadas, {duplicadas} duplicadas (ahorradas), {fallidas} fallaron; {escritas} escritas al vault")
 
     if escritas > 0:
         try:
@@ -282,7 +448,7 @@ def main():
         except Exception as e:
             log(f"WARN vault-committer falló: {e}")
 
-    sys.exit(0 if procesadas > 0 else 1)
+    sys.exit(0 if procesadas + duplicadas > 0 else 1)
 
 
 if __name__ == "__main__":

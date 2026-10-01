@@ -13,8 +13,11 @@ CONCILIO = [
 ]
 ARBITRO = ("Claude Sonnet 4.6 (árbitro)", "anthropic/claude-sonnet-4.6")
 
-def _post(model_id, messages, max_tokens):
-    body = json.dumps({"model": model_id, "max_tokens": max_tokens, "messages": messages}).encode()
+def _post(model_id, messages, max_tokens, temperature=None):
+    payload = {"model": model_id, "max_tokens": max_tokens, "messages": messages}
+    if temperature is not None:
+        payload["temperature"] = temperature
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(API_URL, data=body, headers={
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
