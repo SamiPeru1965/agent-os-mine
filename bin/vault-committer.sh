@@ -23,6 +23,11 @@ fi
 
 if git commit -m "$MSG" > /dev/null 2>&1; then
   echo "$(date -Iseconds) vault-committer OK: $MSG"
+  if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10" timeout 30 git push -q origin HEAD > /dev/null 2>&1; then
+    echo "$(date -Iseconds) vault-committer PUSH OK"
+  else
+    echo "$(date -Iseconds) vault-committer PUSH FAIL (commit local OK, se reintenta en el próximo commit)"
+  fi
 else
   echo "$(date -Iseconds) vault-committer FAIL"
   exit 1
